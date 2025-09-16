@@ -1,0 +1,758 @@
+using Microsoft.EntityFrameworkCore;
+using Same.Data;
+using Same.Models.DTOs.Requests.User;
+using Same.Models.DTOs.Requests.Auth;
+using Same.Models.DTOs.Responses;
+using Same.Models.Entities;
+using Same.Services.Interfaces;
+
+namespace Same.Services.Implementations
+{
+    public class UserService : IUserService
+    {
+        private readonly ApplicationDbContext _context;
+        private readonly ILocationService _locationService;
+
+        public UserService(ApplicationDbContext context, ILocationService locationService)
+        {
+            _context = context;
+            _locationService = locationService;
+        }
+
+        // Profile Management
+        public async Task<ApiResponse<UserResponse>> GetUserByIdAsync(Guid userId, Guid? currentUserId = null)
+        {
+            try
+            {
+                var user = await _context.Users
+                    .Include(u => u.UserHobbies)
+                        .ThenInclude(uh => uh.Hobby)
+                    .Include(u => u.UserRoles)
+                    .FirstOrDefaultAsync(u => u.UserId == userId && u.IsActive);
+
+                if (user == null)
+                {
+                    return ApiResponse<UserResponse>.ErrorResult("User not found");
+                }
+
+                var userResponse = await MapToUserResponse(user, currentUserId);
+                return ApiResponse<UserResponse>.SuccessResult(userResponse);
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<UserResponse>.ErrorResult($"Error retrieving user: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<UserResponse>> GetUserByUsernameAsync(string username, Guid? currentUserId = null)
+        {
+            try
+            {
+                var user = await _context.Users
+                    .Include(u => u.UserHobbies)
+                        .ThenInclude(uh => uh.Hobby)
+                    .Include(u => u.UserRoles)
+                    .FirstOrDefaultAsync(u => u.Username.ToLower() == username.ToLower() && u.IsActive);
+
+                if (user == null)
+                {
+                    return ApiResponse<UserResponse>.ErrorResult("User not found");
+                }
+
+                var userResponse = await MapToUserResponse(user, currentUserId);
+                return ApiResponse<UserResponse>.SuccessResult(userResponse);
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<UserResponse>.ErrorResult($"Error retrieving user: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<List<UserResponse>>> SearchUsersAsync(SearchUsersRequest request, Guid currentUserId)
+        {
+            try
+            {
+                var query = _context.Users.AsQueryable().Where(u => u.IsActive && u.UserId != currentUserId);
+
+                if (!string.IsNullOrEmpty(request.SearchTerm))
+                {
+                    query = query.Where(u => u.Username.Contains(request.SearchTerm) ||
+                                           (u.FirstName != null && u.FirstName.Contains(request.SearchTerm)) ||
+                                           (u.LastName != null && u.LastName.Contains(request.SearchTerm)));
+                }
+
+                if (request.HobbyId.HasValue)
+                {
+                    query = query.Where(u => u.UserHobbies.Any(uh => uh.HobbyId == request.HobbyId.Value));
+                }
+
+                if (!string.IsNullOrEmpty(request.Role))
+                {
+                    query = query.Where(u => u.UserRoles.Any(ur => ur.RoleType == request.Role && ur.IsActive));
+                }
+
+                var users = await query
+                    .Include(u => u.UserHobbies)
+                        .ThenInclude(uh => uh.Hobby)
+                    .Include(u => u.UserRoles)
+                    .Skip((request.Page - 1) * request.PageSize)
+                    .Take(request.PageSize)
+                    .ToListAsync();
+
+                var responses = new List<UserResponse>();
+                foreach (var user in users)
+                {
+                    responses.Add(await MapToUserResponse(user, currentUserId));
+                }
+
+                return ApiResponse<List<UserResponse>>.SuccessResult(responses);
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<List<UserResponse>>.ErrorResult($"Error searching users: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<UserResponse>> UpdateProfileAsync(Guid userId, UpdateProfileRequest request)
+        {
+            try
+            {
+                var user = await _context.Users.FindAsync(userId);
+                if (user == null)
+                {
+                    return ApiResponse<UserResponse>.ErrorResult("User not found");
+                }
+
+                // Update fields
+                if (!string.IsNullOrEmpty(request.FirstName))
+                    user.FirstName = request.FirstName;
+                if (!string.IsNullOrEmpty(request.LastName))
+                    user.LastName = request.LastName;
+                if (request.Bio != null)
+                    user.Bio = request.Bio;
+                if (!string.IsNullOrEmpty(request.PhoneNumber))
+                    user.PhoneNumber = request.PhoneNumber;
+                if (request.DateOfBirth.HasValue)
+                    user.DateOfBirth = request.DateOfBirth;
+                if (!string.IsNullOrEmpty(request.ProfileImageUrl))
+                    user.ProfileImageUrl = request.ProfileImageUrl;
+                if (!string.IsNullOrEmpty(request.CoverImageUrl))
+                    user.CoverImageUrl = request.CoverImageUrl;
+
+                user.UpdatedAt = DateTime.UtcNow;
+                await _context.SaveChangesAsync();
+
+                var userResponse = await MapToUserResponse(user, userId);
+                return ApiResponse<UserResponse>.SuccessResult(userResponse);
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<UserResponse>.ErrorResult($"Error updating profile: {ex.Message}");
+            }
+        }
+
+        // Social Features - Friends & Connections
+        public async Task<ApiResponse<bool>> SendFriendRequestAsync(Guid userId, AddFriendRequest request)
+        {
+            try
+            {
+                // Check if already connected or request exists
+                var existingConnection = await _context.UserConnections
+                    .FirstOrDefaultAsync(uc =>
+                        ((uc.RequesterUserId == userId && uc.ReceiverUserId == request.FriendUserId) ||
+                         (uc.RequesterUserId == request.FriendUserId && uc.ReceiverUserId == userId)) &&
+                        uc.ConnectionType == "Friend");
+
+                if (existingConnection != null)
+                {
+                    return ApiResponse<bool>.ErrorResult("Connection already exists or request pending");
+                }
+
+                var connection = new UserConnection
+                {
+                    RequesterUserId = userId,
+                    ReceiverUserId = request.FriendUserId,
+                    ConnectionType = "Friend",
+                    Status = "Pending",
+                    RequestedAt = DateTime.UtcNow
+                };
+
+                _context.UserConnections.Add(connection);
+                await _context.SaveChangesAsync();
+
+                return ApiResponse<bool>.SuccessResult(true, "Friend request sent successfully");
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<bool>.ErrorResult($"Error sending friend request: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<bool>> RespondToFriendRequestAsync(Guid userId, Guid connectionId, bool accept)
+        {
+            try
+            {
+                var connection = await _context.UserConnections
+                    .FirstOrDefaultAsync(uc => uc.ConnectionId == connectionId && 
+                                             uc.ReceiverUserId == userId && 
+                                             uc.Status == "Pending");
+
+                if (connection == null)
+                {
+                    return ApiResponse<bool>.ErrorResult("Friend request not found");
+                }
+
+                if (accept)
+                {
+                    connection.Status = "Accepted";
+                    connection.AcceptedAt = DateTime.UtcNow;
+                }
+                else
+                {
+                    connection.Status = "Declined";
+                }
+
+                await _context.SaveChangesAsync();
+
+                return ApiResponse<bool>.SuccessResult(true, accept ? "Friend request accepted" : "Friend request declined");
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<bool>.ErrorResult($"Error responding to friend request: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<bool>> RemoveFriendAsync(Guid userId, Guid friendId)
+        {
+            try
+            {
+                var connection = await _context.UserConnections
+                    .FirstOrDefaultAsync(uc =>
+                        ((uc.RequesterUserId == userId && uc.ReceiverUserId == friendId) ||
+                         (uc.RequesterUserId == friendId && uc.ReceiverUserId == userId)) &&
+                        uc.ConnectionType == "Friend" && uc.Status == "Accepted");
+
+                if (connection == null)
+                {
+                    return ApiResponse<bool>.ErrorResult("Friend connection not found");
+                }
+
+                _context.UserConnections.Remove(connection);
+                await _context.SaveChangesAsync();
+
+                return ApiResponse<bool>.SuccessResult(true, "Friend removed successfully");
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<bool>.ErrorResult($"Error removing friend: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<List<ConnectionResponse>>> GetConnectionsAsync(Guid userId, string connectionType)
+        {
+            try
+            {
+                var connections = await _context.UserConnections
+                    .Where(uc => (uc.RequesterUserId == userId || uc.ReceiverUserId == userId) &&
+                               uc.ConnectionType == connectionType && uc.Status == "Accepted")
+                    .Include(uc => uc.RequesterUser)
+                    .Include(uc => uc.ReceiverUser)
+                    .ToListAsync();
+
+                var responses = connections.Select(uc => new ConnectionResponse
+                {
+                    ConnectionId = uc.ConnectionId,
+                    User = uc.RequesterUserId == userId ? 
+                        MapToBasicUserResponse(uc.ReceiverUser!) : 
+                        MapToBasicUserResponse(uc.RequesterUser!),
+                    ConnectionType = uc.ConnectionType,
+                    Status = uc.Status,
+                    CreatedAt = uc.RequestedAt
+                }).ToList();
+
+                return ApiResponse<List<ConnectionResponse>>.SuccessResult(responses);
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<List<ConnectionResponse>>.ErrorResult($"Error retrieving connections: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<List<ConnectionResponse>>> GetPendingRequestsAsync(Guid userId)
+        {
+            try
+            {
+                var requests = await _context.UserConnections
+                    .Where(uc => uc.ReceiverUserId == userId && uc.Status == "Pending")
+                    .Include(uc => uc.RequesterUser)
+                    .ToListAsync();
+
+                var responses = requests.Select(uc => new ConnectionResponse
+                {
+                    ConnectionId = uc.ConnectionId,
+                    User = MapToBasicUserResponse(uc.RequesterUser!),
+                    ConnectionType = uc.ConnectionType,
+                    Status = uc.Status,
+                    CreatedAt = uc.RequestedAt
+                }).ToList();
+
+                return ApiResponse<List<ConnectionResponse>>.SuccessResult(responses);
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<List<ConnectionResponse>>.ErrorResult($"Error retrieving pending requests: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<List<UserResponse>>> GetMutualFriendsAsync(Guid userId, Guid targetUserId)
+        {
+            try
+            {
+                // Get user's friends
+                var userFriends = await _context.UserConnections
+                    .Where(uc => (uc.RequesterUserId == userId || uc.ReceiverUserId == userId) &&
+                               uc.ConnectionType == "Friend" && uc.Status == "Accepted")
+                    .Select(uc => uc.RequesterUserId == userId ? uc.ReceiverUserId : uc.RequesterUserId)
+                    .ToListAsync();
+
+                // Get target user's friends
+                var targetFriends = await _context.UserConnections
+                    .Where(uc => (uc.RequesterUserId == targetUserId || uc.ReceiverUserId == targetUserId) &&
+                               uc.ConnectionType == "Friend" && uc.Status == "Accepted")
+                    .Select(uc => uc.RequesterUserId == targetUserId ? uc.ReceiverUserId : uc.RequesterUserId)
+                    .ToListAsync();
+
+                // Find mutual friends
+                var mutualFriendIds = userFriends.Intersect(targetFriends).ToList();
+
+                var mutualFriends = await _context.Users
+                    .Where(u => mutualFriendIds.Contains(u.UserId))
+                    .ToListAsync();
+
+                var responses = new List<UserResponse>();
+                foreach (var friend in mutualFriends)
+                {
+                    responses.Add(await MapToUserResponse(friend, userId));
+                }
+
+                return ApiResponse<List<UserResponse>>.SuccessResult(responses);
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<List<UserResponse>>.ErrorResult($"Error retrieving mutual friends: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<List<UserResponse>>> GetFriendSuggestionsAsync(Guid userId)
+        {
+            try
+            {
+                // Get user's hobbies
+                var userHobbies = await _context.UserHobbies
+                    .Where(uh => uh.UserId == userId)
+                    .Select(uh => uh.HobbyId)
+                    .ToListAsync();
+
+                // Get users with similar hobbies who aren't already friends
+                var existingConnections = await _context.UserConnections
+                    .Where(uc => (uc.RequesterUserId == userId || uc.ReceiverUserId == userId))
+                    .Select(uc => uc.RequesterUserId == userId ? uc.ReceiverUserId : uc.RequesterUserId)
+                    .ToListAsync();
+
+                var suggestions = await _context.Users
+                    .Where(u => u.UserId != userId && 
+                              u.IsActive && 
+                              !existingConnections.Contains(u.UserId) &&
+                              u.UserHobbies.Any(uh => userHobbies.Contains(uh.HobbyId)))
+                    .Include(u => u.UserHobbies)
+                        .ThenInclude(uh => uh.Hobby)
+                    .Take(10)
+                    .ToListAsync();
+
+                var responses = new List<UserResponse>();
+                foreach (var suggestion in suggestions)
+                {
+                    responses.Add(await MapToUserResponse(suggestion, userId));
+                }
+
+                return ApiResponse<List<UserResponse>>.SuccessResult(responses);
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<List<UserResponse>>.ErrorResult($"Error retrieving friend suggestions: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<bool>> BlockUserAsync(Guid userId, Guid targetUserId)
+        {
+            try
+            {
+                // Remove any existing connection
+                var existingConnection = await _context.UserConnections
+                    .FirstOrDefaultAsync(uc =>
+                        (uc.RequesterUserId == userId && uc.ReceiverUserId == targetUserId) ||
+                        (uc.RequesterUserId == targetUserId && uc.ReceiverUserId == userId));
+
+                if (existingConnection != null)
+                {
+                    _context.UserConnections.Remove(existingConnection);
+                }
+
+                // Add block relationship
+                var blockConnection = new UserConnection
+                {
+                    RequesterUserId = userId,
+                    ReceiverUserId = targetUserId,
+                    ConnectionType = "Block",
+                    Status = "Blocked",
+                    RequestedAt = DateTime.UtcNow
+                };
+
+                _context.UserConnections.Add(blockConnection);
+                await _context.SaveChangesAsync();
+
+                return ApiResponse<bool>.SuccessResult(true, "User blocked successfully");
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<bool>.ErrorResult($"Error blocking user: {ex.Message}");
+            }
+        }
+
+        // Location Features
+        public async Task<ApiResponse<bool>> UpdateLocationAsync(Guid userId, UpdateLocationRequest request)
+        {
+            return await _locationService.UpdateUserLocationAsync(userId, request);
+        }
+
+        public async Task<ApiResponse<List<UserResponse>>> GetNearbyUsersAsync(Guid userId, int radiusKm = 10)
+        {
+            return await _locationService.GetNearbyUsersAsync(userId, radiusKm);
+        }
+
+        // Role Management
+        public async Task<ApiResponse<bool>> UpdateRoleAsync(Guid userId, UpdateRoleRequest request)
+        {
+            try
+            {
+                var existingRole = await _context.UserRoles
+                    .FirstOrDefaultAsync(ur => ur.UserId == userId && ur.RoleType == request.Role);
+
+                if (existingRole != null)
+                {
+                    // Update existing role
+                    existingRole.HourlyRate = request.HourlyRate ?? existingRole.HourlyRate;
+                    existingRole.CommissionRate = request.CommissionRate ?? existingRole.CommissionRate;
+                    existingRole.ServiceRadius = request.ServiceRadius ?? existingRole.ServiceRadius;
+                    existingRole.IsAvailableNow = request.IsAvailableNow ?? existingRole.IsAvailableNow;
+                    existingRole.WorkingHours = request.WorkingHours ?? existingRole.WorkingHours;
+                    existingRole.VerificationDocuments = request.VerificationDocuments ?? existingRole.VerificationDocuments;
+                    existingRole.UpdatedAt = DateTime.UtcNow;
+                }
+                else
+                {
+                    // Create new role
+                    var userRole = new UserRole
+                    {
+                        UserId = userId,
+                        RoleType = request.Role,
+                        HourlyRate = request.HourlyRate ?? 0,
+                        CommissionRate = request.CommissionRate ?? 0,
+                        ServiceRadius = request.ServiceRadius ?? 10,
+                        IsActive = true,
+                        IsAvailableNow = request.IsAvailableNow ?? false,
+                        WorkingHours = request.WorkingHours,
+                        VerificationStatus = "Pending",
+                        VerificationDocuments = request.VerificationDocuments,
+                        CreatedAt = DateTime.UtcNow,
+                        UpdatedAt = DateTime.UtcNow
+                    };
+
+                    _context.UserRoles.Add(userRole);
+                }
+
+                await _context.SaveChangesAsync();
+                return ApiResponse<bool>.SuccessResult(true, "User role updated successfully");
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<bool>.ErrorResult($"Error updating user role: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<List<UserRoleResponse>>> GetUserRolesAsync(Guid userId)
+        {
+            try
+            {
+                var roles = await _context.UserRoles
+                    .Where(ur => ur.UserId == userId)
+                    .ToListAsync();
+
+                var responses = roles.Select(ur => new UserRoleResponse
+                {
+                    RoleType = ur.RoleType,
+                    IsActive = ur.IsActive,
+                    ServiceRadius = ur.ServiceRadius,
+                    HourlyRate = ur.HourlyRate,
+                    CommissionRate = ur.CommissionRate,
+                    VerificationStatus = ur.VerificationStatus,
+                    IsAvailableNow = ur.IsAvailableNow,
+                    WorkingHours = ur.WorkingHours
+                }).ToList();
+
+                return ApiResponse<List<UserRoleResponse>>.SuccessResult(responses);
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<List<UserRoleResponse>>.ErrorResult($"Error retrieving user roles: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<bool>> ToggleRoleStatusAsync(Guid userId, string roleType, bool isActive)
+        {
+            try
+            {
+                var role = await _context.UserRoles
+                    .FirstOrDefaultAsync(ur => ur.UserId == userId && ur.RoleType == roleType);
+
+                if (role == null)
+                {
+                    return ApiResponse<bool>.ErrorResult("Role not found");
+                }
+
+                role.IsActive = isActive;
+                role.UpdatedAt = DateTime.UtcNow;
+
+                await _context.SaveChangesAsync();
+                return ApiResponse<bool>.SuccessResult(true, $"Role {roleType} {(isActive ? "activated" : "deactivated")} successfully");
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<bool>.ErrorResult($"Error toggling role status: {ex.Message}");
+            }
+        }
+
+        // Statistics & Analytics
+        public async Task<ApiResponse<object>> GetUserStatsAsync(Guid userId)
+        {
+            try
+            {
+                var friendsCount = await _context.UserConnections
+                    .CountAsync(uc => (uc.RequesterUserId == userId || uc.ReceiverUserId == userId) &&
+                                    uc.Status == "Accepted" && uc.ConnectionType == "Friend");
+
+                var eventsCreated = await _context.Events
+                    .CountAsync(e => e.CreatorUserId == userId);
+
+                var averageRating = await _context.Reviews
+                    .Where(r => r.ReviewedUserId == userId)
+                    .AverageAsync(r => (double?)r.Rating) ?? 0.0;
+
+                var stats = new
+                {
+                    FriendsCount = friendsCount,
+                    EventsCreated = eventsCreated,
+                    AverageRating = Math.Round(averageRating, 1)
+                };
+
+                return ApiResponse<object>.SuccessResult(stats);
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<object>.ErrorResult($"Error retrieving user stats: {ex.Message}");
+            }
+        }
+
+        // Hobbies Management
+        public async Task<ApiResponse<bool>> AddUserHobbyAsync(Guid userId, Guid hobbyId, string skillLevel = "Beginner", int yearsExperience = 0)
+        {
+            try
+            {
+                var existingUserHobby = await _context.UserHobbies
+                    .FirstOrDefaultAsync(uh => uh.UserId == userId && uh.HobbyId == hobbyId);
+
+                if (existingUserHobby != null)
+                {
+                    return ApiResponse<bool>.ErrorResult("User already has this hobby");
+                }
+
+                var userHobby = new UserHobby
+                {
+                    UserId = userId,
+                    HobbyId = hobbyId,
+                    SkillLevel = skillLevel,
+                    YearsExperience = yearsExperience,
+                    JoinedAt = DateTime.UtcNow
+                };
+
+                _context.UserHobbies.Add(userHobby);
+
+                // Update hobby community size
+                var hobby = await _context.Hobbies.FindAsync(hobbyId);
+                if (hobby != null)
+                {
+                    hobby.CommunitySize++;
+                }
+
+                await _context.SaveChangesAsync();
+                return ApiResponse<bool>.SuccessResult(true, "Hobby added successfully");
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<bool>.ErrorResult($"Error adding user hobby: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<bool>> RemoveUserHobbyAsync(Guid userId, Guid hobbyId)
+        {
+            try
+            {
+                var userHobby = await _context.UserHobbies
+                    .FirstOrDefaultAsync(uh => uh.UserId == userId && uh.HobbyId == hobbyId);
+
+                if (userHobby == null)
+                {
+                    return ApiResponse<bool>.ErrorResult("User hobby not found");
+                }
+
+                _context.UserHobbies.Remove(userHobby);
+
+                // Update hobby community size
+                var hobby = await _context.Hobbies.FindAsync(hobbyId);
+                if (hobby != null && hobby.CommunitySize > 0)
+                {
+                    hobby.CommunitySize--;
+                }
+
+                await _context.SaveChangesAsync();
+                return ApiResponse<bool>.SuccessResult(true, "Hobby removed successfully");
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<bool>.ErrorResult($"Error removing user hobby: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<List<UserHobbyResponse>>> GetUserHobbiesAsync(Guid userId)
+        {
+            try
+            {
+                var userHobbies = await _context.UserHobbies
+                    .Where(uh => uh.UserId == userId)
+                    .Include(uh => uh.Hobby)
+                    .ToListAsync();
+
+                var responses = userHobbies.Select(uh => new UserHobbyResponse
+                {
+                    HobbyId = uh.HobbyId,
+                    Name = uh.Hobby.Name,
+                    Type = uh.Hobby.Type,
+                    SkillLevel = uh.SkillLevel,
+                    YearsExperience = uh.YearsExperience,
+                    PersonalDescription = uh.PersonalDescription
+                }).ToList();
+
+                return ApiResponse<List<UserHobbyResponse>>.SuccessResult(responses);
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<List<UserHobbyResponse>>.ErrorResult($"Error retrieving user hobbies: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<List<UserResponse>>> GetUsersByHobbyAsync(Guid hobbyId, Guid currentUserId)
+        {
+            try
+            {
+                var users = await _context.UserHobbies
+                    .Where(uh => uh.HobbyId == hobbyId && uh.UserId != currentUserId)
+                    .Include(uh => uh.User)
+                        .ThenInclude(u => u!.UserHobbies)
+                            .ThenInclude(uh => uh.Hobby)
+                    .Select(uh => uh.User!)
+                    .Where(u => u.IsActive)
+                    .ToListAsync();
+
+                var responses = new List<UserResponse>();
+                foreach (var user in users)
+                {
+                    responses.Add(await MapToUserResponse(user, currentUserId));
+                }
+
+                return ApiResponse<List<UserResponse>>.SuccessResult(responses);
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<List<UserResponse>>.ErrorResult($"Error retrieving users by hobby: {ex.Message}");
+            }
+        }
+
+        // Helper Methods
+        private async Task<UserResponse> MapToUserResponse(User user, Guid? currentUserId)
+        {
+            var response = new UserResponse
+            {
+                UserId = user.UserId,
+                Username = user.Username,
+                Email = user.Email,
+                FirstName = user.FirstName,
+                LastName = user.LastName,
+                FullName = user.FullName,
+                ProfileImageUrl = user.ProfileImageUrl,
+                CoverImageUrl = user.CoverImageUrl,
+                Bio = user.Bio,
+                PhoneNumber = user.PhoneNumber,
+                DateOfBirth = user.DateOfBirth,
+                Age = user.Age,
+                CurrentLatitude = user.CurrentLatitude,
+                CurrentLongitude = user.CurrentLongitude,
+                LocationAddress = user.LocationAddress,
+                LocationPrivacy = user.LocationPrivacy,
+                LocationUpdatedAt = user.LocationUpdatedAt,
+                IsActive = user.IsActive,
+                IsVerified = user.IsVerified,
+                JoinDate = user.JoinDate,
+                LastLoginAt = user.LastLoginAt,
+                Hobbies = user.UserHobbies?.Select(uh => new HobbyResponse
+                {
+                    HobbyId = uh.Hobby.HobbyId,
+                    Name = uh.Hobby.Name,
+                    Type = uh.Hobby.Type,
+                    Description = uh.Hobby.Description,
+                    IconUrl = uh.Hobby.IconUrl,
+                    CommunitySize = uh.Hobby.CommunitySize,
+                    IsActive = uh.Hobby.IsActive
+                }).ToList() ?? new List<HobbyResponse>()
+            };
+
+            // Add relationship status if currentUserId is provided
+            if (currentUserId.HasValue && currentUserId != user.UserId)
+            {
+                var connection = await _context.UserConnections
+                    .FirstOrDefaultAsync(uc =>
+                        ((uc.RequesterUserId == currentUserId && uc.ReceiverUserId == user.UserId) ||
+                         (uc.RequesterUserId == user.UserId && uc.ReceiverUserId == currentUserId)) &&
+                        uc.ConnectionType == "Friend");
+
+                response.RelationshipStatus = connection?.Status ?? "None";
+                response.IsFriend = connection?.Status == "Accepted";
+            }
+
+            return response;
+        }
+
+        private UserResponse MapToBasicUserResponse(User user)
+        {
+            return new UserResponse
+            {
+                UserId = user.UserId,
+                Username = user.Username,
+                FirstName = user.FirstName,
+                LastName = user.LastName,
+                ProfileImageUrl = user.ProfileImageUrl,
+                IsActive = user.IsActive,
+                IsVerified = user.IsVerified
+            };
+        }
+    }
+}

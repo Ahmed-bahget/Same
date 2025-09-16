@@ -1,0 +1,718 @@
+using System.Security.Cryptography;
+using System.Text;
+using System.IdentityModel.Tokens.Jwt;
+using Microsoft.IdentityModel.Tokens;
+using System.Security.Claims;
+using Microsoft.EntityFrameworkCore;
+using Same.Data;
+using Same.Services.Interfaces;
+using Same.Models.Entities;
+using Same.Models.DTOs.Requests.Auth;
+using Same.Models.DTOs.Requests.User;
+using Same.Models.DTOs.Responses;
+using Same.Utils.Helpers;
+
+namespace Same.Services.Implementations
+{
+    public class AuthService : IAuthService
+    {
+        private readonly ApplicationDbContext _context;
+        private readonly IConfiguration _configuration;
+        private readonly ILocationService _locationService;
+        private readonly INotificationService _notificationService;
+
+        public AuthService(
+            ApplicationDbContext context,
+            IConfiguration configuration,
+            ILocationService locationService,
+            INotificationService notificationService)
+        {
+            _context = context;
+            _configuration = configuration;
+            _locationService = locationService;
+            _notificationService = notificationService;
+        }
+
+        public async Task<ApiResponse<AuthResponse>> RegisterAsync(RegisterRequest request)
+        {
+            try
+            {
+                // Check if user already exists
+                if (await _context.Users.AnyAsync(u => u.Email == request.Email))
+                    return ApiResponse<AuthResponse>.ErrorResult("Email already registered");
+
+                if (await _context.Users.AnyAsync(u => u.Username == request.Username))
+                    return ApiResponse<AuthResponse>.ErrorResult("Username already taken");
+
+                // Create new user
+                var user = new User
+                {
+                    Username = request.Username,
+                    Email = request.Email,
+                    PasswordHash = BCrypt.Net.BCrypt.HashPassword(request.Password),
+                    FirstName = request.FirstName,
+                    LastName = request.LastName,
+                    PhoneNumber = request.PhoneNumber,
+                    DateOfBirth = request.DateOfBirth,
+                    ProfileImageUrl = request.ProfileImageUrl,
+                    CurrentLatitude = request.Latitude,
+                    CurrentLongitude = request.Longitude,
+                    LocationAddress = request.LocationAddress,
+                    LocationUpdatedAt = request.Latitude.HasValue ? DateTime.UtcNow : null
+                };
+
+                _context.Users.Add(user);
+
+                // Add default consumer role
+                var consumerRole = new UserRole
+                {
+                    UserId = user.UserId,
+                    RoleType = "Consumer",
+                    IsActive = true
+                };
+                _context.UserRoles.Add(consumerRole);
+
+                // Add user hobbies if provided
+                if (request.HobbyIds?.Any() == true)
+                {
+                    foreach (var hobbyId in request.HobbyIds)
+                    {
+                        if (await _context.Hobbies.AnyAsync(h => h.HobbyId == hobbyId))
+                        {
+                            _context.UserHobbies.Add(new UserHobby
+                            {
+                                UserId = user.UserId,
+                                HobbyId = hobbyId
+                            });
+                        }
+                    }
+                }
+
+                await _context.SaveChangesAsync();
+
+                // Generate JWT token
+                var token = GenerateJwtToken(user);
+                var refreshToken = GenerateRefreshToken();
+
+                // Update user with refresh token (you'd store this securely)
+                user.LastLoginAt = DateTime.UtcNow;
+                await _context.SaveChangesAsync();
+
+                var userResponse = await MapToUserResponse(user, null);
+
+                return ApiResponse<AuthResponse>.SuccessResult(new AuthResponse
+                {
+                    Token = token,
+                    ExpiresAt = DateTime.UtcNow.AddDays(30),
+                    User = userResponse,
+                    RefreshToken = refreshToken
+                });
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<AuthResponse>.ErrorResult($"Registration failed: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<AuthResponse>> LoginAsync(LoginRequest request)
+        {
+            try
+            {
+                // Find user by email or username
+                var user = await _context.Users
+                    .Include(u => u.UserRoles)
+                    .Include(u => u.UserHobbies)
+                        .ThenInclude(uh => uh.Hobby)
+                    .FirstOrDefaultAsync(u => 
+                        u.Email == request.EmailOrUsername || 
+                        u.Username == request.EmailOrUsername);
+
+                if (user == null || !BCrypt.Net.BCrypt.Verify(request.Password, user.PasswordHash))
+                    return ApiResponse<AuthResponse>.ErrorResult("Invalid credentials");
+
+                if (!user.IsActive)
+                    return ApiResponse<AuthResponse>.ErrorResult("Account is deactivated");
+
+                // Update last login
+                user.LastLoginAt = DateTime.UtcNow;
+                await _context.SaveChangesAsync();
+
+                // Generate tokens
+                var token = GenerateJwtToken(user);
+                var refreshToken = GenerateRefreshToken();
+
+                var userResponse = await MapToUserResponse(user, null);
+
+                return ApiResponse<AuthResponse>.SuccessResult(new AuthResponse
+                {
+                    Token = token,
+                    ExpiresAt = DateTime.UtcNow.AddDays(30),
+                    User = userResponse,
+                    RefreshToken = refreshToken
+                });
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<AuthResponse>.ErrorResult($"Login failed: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<string>> RefreshTokenAsync(string refreshToken)
+        {
+            // Implementation for refresh token logic
+            // This would typically involve validating the refresh token and generating a new JWT
+            await Task.CompletedTask;
+            return ApiResponse<string>.ErrorResult("Not implemented");
+        }
+
+        public async Task<ApiResponse<bool>> LogoutAsync(Guid userId)
+        {
+            try
+            {
+                // Invalidate refresh tokens, update last activity, etc.
+                var user = await _context.Users.FindAsync(userId);
+                if (user != null)
+                {
+                    // Clear refresh token from database if stored there
+                    await _context.SaveChangesAsync();
+                }
+                return ApiResponse<bool>.SuccessResult(true);
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<bool>.ErrorResult($"Logout failed: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<bool>> VerifyEmailAsync(string token)
+        {
+            // Email verification implementation
+            await Task.CompletedTask;
+            return ApiResponse<bool>.ErrorResult("Not implemented");
+        }
+
+        public async Task<ApiResponse<bool>> ForgotPasswordAsync(string email)
+        {
+            // Password reset email implementation
+            await Task.CompletedTask;
+            return ApiResponse<bool>.ErrorResult("Not implemented");
+        }
+
+        public async Task<ApiResponse<bool>> ResetPasswordAsync(string token, string newPassword)
+        {
+            // Password reset implementation
+            await Task.CompletedTask;
+            return ApiResponse<bool>.ErrorResult("Not implemented");
+        }
+
+        private string GenerateJwtToken(User user)
+        {
+            var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_configuration["Jwt:Key"]!));
+            var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+            var claims = new[]
+            {
+                new Claim(ClaimTypes.NameIdentifier, user.UserId.ToString()),
+                new Claim(ClaimTypes.Name, user.Username),
+                new Claim(ClaimTypes.Email, user.Email),
+                new Claim("FirstName", user.FirstName ?? ""),
+                new Claim("LastName", user.LastName ?? "")
+            };
+
+            var token = new JwtSecurityToken(
+                issuer: _configuration["Jwt:Issuer"],
+                audience: _configuration["Jwt:Audience"],
+                claims: claims,
+                expires: DateTime.UtcNow.AddDays(30),
+                signingCredentials: credentials
+            );
+
+            return new JwtSecurityTokenHandler().WriteToken(token);
+        }
+
+        private string GenerateRefreshToken()
+        {
+            var randomBytes = new byte[64];
+            using var rng = RandomNumberGenerator.Create();
+            rng.GetBytes(randomBytes);
+            return Convert.ToBase64String(randomBytes);
+        }
+
+        private async Task<UserResponse> MapToUserResponse(User user, Guid? currentUserId)
+        {
+            var friendCount = await _context.UserConnections
+                .CountAsync(uc => (uc.RequesterUserId == user.UserId || uc.ReceiverUserId == user.UserId) 
+                                 && uc.Status == "Accepted" && uc.ConnectionType == "Friend");
+
+            var eventCount = await _context.Events
+                .CountAsync(e => e.CreatorUserId == user.UserId);
+
+            var reviews = await _context.Reviews
+                .Where(r => r.ReviewedUserId == user.UserId)
+                .ToListAsync();
+
+            string? connectionStatus = null;
+            if (currentUserId.HasValue && currentUserId != user.UserId)
+            {
+                var connection = await _context.UserConnections
+                    .FirstOrDefaultAsync(uc => 
+                        (uc.RequesterUserId == currentUserId && uc.ReceiverUserId == user.UserId) ||
+                        (uc.RequesterUserId == user.UserId && uc.ReceiverUserId == currentUserId));
+                connectionStatus = connection?.Status;
+            }
+
+            return new UserResponse
+            {
+                UserId = user.UserId,
+                Username = user.Username,
+                Email = user.Email,
+                FirstName = user.FirstName,
+                LastName = user.LastName,
+                FullName = user.FullName,
+                ProfileImageUrl = user.ProfileImageUrl,
+                CoverImageUrl = user.CoverImageUrl,
+                Bio = user.Bio,
+                PhoneNumber = user.PhoneNumber,
+                Age = user.Age,
+                LocationAddress = user.LocationAddress,
+                IsVerified = user.IsVerified,
+                JoinDate = user.JoinDate,
+                LastLoginAt = user.LastLoginAt,
+                FriendCount = friendCount,
+                HobbyCount = user.UserHobbies.Count,
+                CreatedEventsCount = eventCount,
+                AverageRating = reviews.Any() ? reviews.Average(r => r.Rating) : null,
+                ReviewCount = reviews.Count,
+                ConnectionStatus = connectionStatus,
+                Hobbies = user.UserHobbies.Select(uh => new UserHobbyResponse
+                {
+                    HobbyId = uh.HobbyId,
+                    Name = uh.Hobby.Name,
+                    Type = uh.Hobby.Type,
+                    SkillLevel = uh.SkillLevel,
+                    YearsExperience = uh.YearsExperience,
+                    PersonalDescription = uh.PersonalDescription
+                }).ToList(),
+                Roles = user.UserRoles.Select(ur => new UserRoleResponse
+                {
+                    RoleType = ur.RoleType,
+                    IsActive = ur.IsActive,
+                    ServiceRadius = ur.ServiceRadius,
+                    HourlyRate = ur.HourlyRate,
+                    CommissionRate = ur.CommissionRate,
+                    VerificationStatus = ur.VerificationStatus,
+                    IsAvailableNow = ur.IsAvailableNow,
+                    WorkingHours = !string.IsNullOrEmpty(ur.WorkingHours) ? 
+                        System.Text.Json.JsonSerializer.Deserialize<object>(ur.WorkingHours) : null
+                }).ToList()
+            };
+        }
+    }
+}
+        private readonly ILocationService _locationService;
+        private readonly INotificationService _notificationService;
+
+        public UserService(
+            ApplicationDbContext context,
+            ILocationService locationService,
+            INotificationService notificationService)
+        {
+            _context = context;
+            _locationService = locationService;
+            _notificationService = notificationService;
+        }
+
+        public async Task<ApiResponse<UserResponse>> GetUserByIdAsync(Guid userId, Guid? currentUserId = null)
+        {
+            try
+            {
+                var user = await _context.Users
+                    .Include(u => u.UserRoles)
+                    .Include(u => u.UserHobbies.Where(uh => uh.IsPublic))
+                        .ThenInclude(uh => uh.Hobby)
+                    .FirstOrDefaultAsync(u => u.UserId == userId && u.IsActive);
+
+                if (user == null)
+                    return ApiResponse<UserResponse>.ErrorResult("User not found");
+
+                var userResponse = await MapToUserResponse(user, currentUserId);
+
+                // Calculate distance if both users have location
+                if (currentUserId.HasValue && user.CurrentLatitude.HasValue && user.CurrentLongitude.HasValue)
+                {
+                    var currentUser = await _context.Users
+                        .FirstOrDefaultAsync(u => u.UserId == currentUserId);
+                    
+                    if (currentUser?.CurrentLatitude.HasValue == true && currentUser?.CurrentLongitude.HasValue == true)
+                    {
+                        userResponse.Distance = LocationHelper.CalculateDistance(
+                            (double)currentUser.CurrentLatitude, (double)currentUser.CurrentLongitude,
+                            (double)user.CurrentLatitude, (double)user.CurrentLongitude);
+                    }
+                }
+
+                return ApiResponse<UserResponse>.SuccessResult(userResponse);
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<UserResponse>.ErrorResult($"Error retrieving user: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<UserResponse>> GetUserByUsernameAsync(string username, Guid? currentUserId = null)
+        {
+            try
+            {
+                var user = await _context.Users
+                    .Include(u => u.UserRoles)
+                    .Include(u => u.UserHobbies.Where(uh => uh.IsPublic))
+                        .ThenInclude(uh => uh.Hobby)
+                    .FirstOrDefaultAsync(u => u.Username == username && u.IsActive);
+
+                if (user == null)
+                    return ApiResponse<UserResponse>.ErrorResult("User not found");
+
+                var userResponse = await MapToUserResponse(user, currentUserId);
+                return ApiResponse<UserResponse>.SuccessResult(userResponse);
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<UserResponse>.ErrorResult($"Error retrieving user: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<UserResponse>> UpdateProfileAsync(Guid userId, UpdateProfileRequest request)
+        {
+            try
+            {
+                var user = await _context.Users
+                    .Include(u => u.UserRoles)
+                    .Include(u => u.UserHobbies)
+                        .ThenInclude(uh => uh.Hobby)
+                    .FirstOrDefaultAsync(u => u.UserId == userId);
+
+                if (user == null)
+                    return ApiResponse<UserResponse>.ErrorResult("User not found");
+
+                // Update user fields
+                user.FirstName = request.FirstName ?? user.FirstName;
+                user.LastName = request.LastName ?? user.LastName;
+                user.Bio = request.Bio ?? user.Bio;
+                user.PhoneNumber = request.PhoneNumber ?? user.PhoneNumber;
+                user.DateOfBirth = request.DateOfBirth ?? user.DateOfBirth;
+                user.ProfileImageUrl = request.ProfileImageUrl ?? user.ProfileImageUrl;
+                user.CoverImageUrl = request.CoverImageUrl ?? user.CoverImageUrl;
+                user.UpdatedAt = DateTime.UtcNow;
+
+                await _context.SaveChangesAsync();
+
+                var userResponse = await MapToUserResponse(user, null);
+                return ApiResponse<UserResponse>.SuccessResult(userResponse, "Profile updated successfully");
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<UserResponse>.ErrorResult($"Error updating profile: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<List<UserResponse>>> SearchUsersAsync(SearchUsersRequest request, Guid? currentUserId = null)
+        {
+            try
+            {
+                var query = _context.Users
+                    .Include(u => u.UserRoles)
+                    .Include(u => u.UserHobbies.Where(uh => uh.IsPublic))
+                        .ThenInclude(uh => uh.Hobby)
+                    .Where(u => u.IsActive);
+
+                // Text search
+                if (!string.IsNullOrEmpty(request.Query))
+                {
+                    query = query.Where(u => 
+                        u.Username.Contains(request.Query) ||
+                        u.FirstName!.Contains(request.Query) ||
+                        u.LastName!.Contains(request.Query) ||
+                        u.Bio!.Contains(request.Query));
+                }
+
+                // Hobby filter
+                if (request.HobbyIds?.Any() == true)
+                {
+                    query = query.Where(u => u.UserHobbies
+                        .Any(uh => request.HobbyIds.Contains(uh.HobbyId)));
+                }
+
+                // Location filter
+                if (request.Latitude.HasValue && request.Longitude.HasValue && request.MaxDistance.HasValue)
+                {
+                    // This is a simplified distance calculation - in production you'd use spatial queries
+                    query = query.Where(u => u.CurrentLatitude.HasValue && u.CurrentLongitude.HasValue);
+                }
+
+                // Exclude current user
+                if (currentUserId.HasValue)
+                {
+                    query = query.Where(u => u.UserId != currentUserId);
+                }
+
+                var totalCount = await query.CountAsync();
+                
+                var users = await query
+                    .Skip((request.Page - 1) * request.PageSize)
+                    .Take(request.PageSize)
+                    .ToListAsync();
+
+                var userResponses = new List<UserResponse>();
+                foreach (var user in users)
+                {
+                    var userResponse = await MapToUserResponse(user, currentUserId);
+                    
+                    // Calculate distance if location provided
+                    if (request.Latitude.HasValue && request.Longitude.HasValue &&
+                        user.CurrentLatitude.HasValue && user.CurrentLongitude.HasValue)
+                    {
+                        userResponse.Distance = LocationHelper.CalculateDistance(
+                            (double)request.Latitude, (double)request.Longitude,
+                            (double)user.CurrentLatitude, (double)user.CurrentLongitude);
+                    }
+                    
+                    userResponses.Add(userResponse);
+                }
+
+                // Filter by distance after calculation
+                if (request.MaxDistance.HasValue)
+                {
+                    userResponses = userResponses
+                        .Where(u => u.Distance <= request.MaxDistance)
+                        .ToList();
+                }
+
+                return ApiResponse<List<UserResponse>>.SuccessResult(userResponses);
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<List<UserResponse>>.ErrorResult($"Error searching users: {ex.Message}");
+            }
+        }
+
+        public async Task<ApiResponse<bool>> SendFriendRequestAsync(Guid requesterId, AddFriendRequest request)
+        {
+            try
+            {
+                // Check if connection already exists
+                var existingConnection = await _context.UserConnections
+                    .FirstOrDefaultAsync(uc => 
+                        ((uc.RequesterUserId == requesterId && uc.ReceiverUserId == request.UserId) ||
+                         (uc.RequesterUserId == request.UserId && uc.ReceiverUserId == requesterId)) &&
+                        uc.ConnectionType == request.ConnectionType);
+
+                if (existingConnection != null)
+                {
+                    if (existingConnection.Status == "Accepted")
+                        return ApiResponse<bool>.ErrorResult("You are already connected");
+                    if (existingConnection.Status == "Pending")
+                        return ApiResponse<bool>.ErrorResult("Connection request already pending");
+                    if (existingConnection.Status == "Blocked")
+                        return ApiResponse<bool>.ErrorResult("Unable to send request");
+                }
+
+                // Verify target user exists
+                var targetUser = await _context.Users
+                    .FirstOrDefaultAsync(u => u.UserId == request.UserId && u.IsActive);
+
+                if (targetUser == null)
+                    return ApiResponse<bool>.ErrorResult("User not found");
+
+                // Create connection request
+                var connection = new UserConnection
+                {
+                    RequesterUserId = requesterId,
+                    ReceiverUserId = request.UserId,
+                    ConnectionType = request.ConnectionType,
+                    Status = "Pending"
+                };
+
+                _context.UserConnections.Add(connection);
+                await _context.SaveChangesAsync();
+
+                // Send notification
+                await _notificationService.SendNotificationAsync(
+                    request.UserId,
+                    "Friend_Request",
+                    "New friend request",
+                    $"You have a new {request.ConnectionType.ToLower()} request",
+                    requesterId,
+                    "User"
+                );
+
+                return ApiResponse<bool>.SuccessResult(true, "Connection request sent");
+            }
+            catch (Exception ex)
+            {
+                return ApiResponse<bool>.ErrorResult($"Error sending request: {ex.Message}");
+            }
+        }
+
+        // Implement remaining methods...
+        public async Task<ApiResponse<bool>> RespondToFriendRequestAsync(Guid userId, Guid connectionId, bool accept)
+        {
+            // Implementation for responding to friend requests
+            await Task.CompletedTask;
+            return ApiResponse<bool>.ErrorResult("Not implemented");
+        }
+
+        public async Task<ApiResponse<List<ConnectionResponse>>> GetConnectionsAsync(Guid userId, string type = "Friend")
+        {
+            // Implementation for getting user connections
+            await Task.CompletedTask;
+            return ApiResponse<List<ConnectionResponse>>.ErrorResult("Not implemented");
+        }
+
+        public async Task<ApiResponse<List<ConnectionResponse>>> GetPendingRequestsAsync(Guid userId)
+        {
+            // Implementation for getting pending requests
+            await Task.CompletedTask;
+            return ApiResponse<List<ConnectionResponse>>.ErrorResult("Not implemented");
+        }
+
+        public async Task<ApiResponse<bool>> RemoveFriendAsync(Guid userId, Guid friendId)
+        {
+            // Implementation for removing friends
+            await Task.CompletedTask;
+            return ApiResponse<bool>.ErrorResult("Not implemented");
+        }
+
+        public async Task<ApiResponse<bool>> BlockUserAsync(Guid userId, Guid targetUserId)
+        {
+            // Implementation for blocking users
+            await Task.CompletedTask;
+            return ApiResponse<bool>.ErrorResult("Not implemented");
+        }
+
+        public async Task<ApiResponse<bool>> UpdateLocationAsync(Guid userId, UpdateLocationRequest request)
+        {
+            // Implementation for updating location
+            await Task.CompletedTask;
+            return ApiResponse<bool>.ErrorResult("Not implemented");
+        }
+
+        public async Task<ApiResponse<List<UserResponse>>> GetNearbyUsersAsync(Guid userId, int radiusKm = 10)
+        {
+            // Implementation for getting nearby users
+            await Task.CompletedTask;
+            return ApiResponse<List<UserResponse>>.ErrorResult("Not implemented");
+        }
+
+        public async Task<ApiResponse<bool>> UpdateRoleAsync(Guid userId, UpdateRoleRequest request)
+        {
+            // Implementation for updating user roles
+            await Task.CompletedTask;
+            return ApiResponse<bool>.ErrorResult("Not implemented");
+        }
+
+        public async Task<ApiResponse<List<UserRoleResponse>>> GetUserRolesAsync(Guid userId)
+        {
+            // Implementation for getting user roles
+            await Task.CompletedTask;
+            return ApiResponse<List<UserRoleResponse>>.ErrorResult("Not implemented");
+        }
+
+        public async Task<ApiResponse<bool>> ToggleRoleStatusAsync(Guid userId, string roleType, bool isActive)
+        {
+            // Implementation for toggling role status
+            await Task.CompletedTask;
+            return ApiResponse<bool>.ErrorResult("Not implemented");
+        }
+
+        public async Task<ApiResponse<object>> GetUserStatsAsync(Guid userId)
+        {
+            // Implementation for getting user statistics
+            await Task.CompletedTask;
+            return ApiResponse<object>.ErrorResult("Not implemented");
+        }
+
+        public async Task<ApiResponse<List<UserResponse>>> GetMutualFriendsAsync(Guid userId, Guid targetUserId)
+        {
+            // Implementation for getting mutual friends
+            await Task.CompletedTask;
+            return ApiResponse<List<UserResponse>>.ErrorResult("Not implemented");
+        }
+
+        public async Task<ApiResponse<List<UserResponse>>> GetFriendSuggestionsAsync(Guid userId)
+        {
+            // Implementation for getting friend suggestions
+            await Task.CompletedTask;
+            return ApiResponse<List<UserResponse>>.ErrorResult("Not implemented");
+        }
+
+        private async Task<UserResponse> MapToUserResponse(User user, Guid? currentUserId)
+        {
+            var friendCount = await _context.UserConnections
+                .CountAsync(uc => (uc.RequesterUserId == user.UserId || uc.ReceiverUserId == user.UserId) 
+                                 && uc.Status == "Accepted" && uc.ConnectionType == "Friend");
+
+            var eventCount = await _context.Events
+                .CountAsync(e => e.CreatorUserId == user.UserId);
+
+            var reviews = await _context.Reviews
+                .Where(r => r.ReviewedUserId == user.UserId)
+                .ToListAsync();
+
+            string? connectionStatus = null;
+            if (currentUserId.HasValue && currentUserId != user.UserId)
+            {
+                var connection = await _context.UserConnections
+                    .FirstOrDefaultAsync(uc => 
+                        (uc.RequesterUserId == currentUserId && uc.ReceiverUserId == user.UserId) ||
+                        (uc.RequesterUserId == user.UserId && uc.ReceiverUserId == currentUserId));
+                connectionStatus = connection?.Status;
+            }
+
+            return new UserResponse
+            {
+                UserId = user.UserId,
+                Username = user.Username,
+                Email = user.Email,
+                FirstName = user.FirstName,
+                LastName = user.LastName,
+                FullName = user.FullName,
+                ProfileImageUrl = user.ProfileImageUrl,
+                CoverImageUrl = user.CoverImageUrl,
+                Bio = user.Bio,
+                PhoneNumber = user.PhoneNumber,
+                Age = user.Age,
+                LocationAddress = user.LocationAddress,
+                IsVerified = user.IsVerified,
+                JoinDate = user.JoinDate,
+                LastLoginAt = user.LastLoginAt,
+                FriendCount = friendCount,
+                HobbyCount = user.UserHobbies.Count,
+                CreatedEventsCount = eventCount,
+                AverageRating = reviews.Any() ? reviews.Average(r => r.Rating) : null,
+                ReviewCount = reviews.Count,
+                ConnectionStatus = connectionStatus,
+                Hobbies = user.UserHobbies.Where(uh => uh.IsPublic).Select(uh => new UserHobbyResponse
+                {
+                    HobbyId = uh.HobbyId,
+                    Name = uh.Hobby.Name,
+                    Type = uh.Hobby.Type,
+                    SkillLevel = uh.SkillLevel,
+                    YearsExperience = uh.YearsExperience,
+                    PersonalDescription = uh.PersonalDescription
+                }).ToList(),
+                Roles = user.UserRoles.Where(ur => ur.IsActive).Select(ur => new UserRoleResponse
+                {
+                    RoleType = ur.RoleType,
+                    IsActive = ur.IsActive,
+                    ServiceRadius = ur.ServiceRadius,
+                    HourlyRate = ur.HourlyRate,
+                    CommissionRate = ur.CommissionRate,
+                    VerificationStatus = ur.VerificationStatus,
+                    IsAvailableNow = ur.IsAvailableNow,
+                    WorkingHours = !string.IsNullOrEmpty(ur.WorkingHours) ? 
+                        System.Text.Json.JsonSerializer.Deserialize<object>(ur.WorkingHours) : null
+                }).ToList()
+            };
+        }
+    }
+}    
